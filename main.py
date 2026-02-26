@@ -494,6 +494,8 @@ async def proxy(path: str, request: Request):
                 traceback.print_exc()
             if attempt < max_attempts - 1:
                 CLIENT = create_async_client()
+                await asyncio.sleep(retry_delay)
+                continue
             else:
                 return Response(
                     content=json.dumps({"error": {"message": str(e)}}), status_code=500
