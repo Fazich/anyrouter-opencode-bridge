@@ -210,6 +210,14 @@ def transform_request_body(body):
                     and block.get("name")
                 ):
                     block["name"] = map_tool_name(block.get("name"))
+                    # 兜底注入 Task 工具的必填参数（模型偶尔不传或历史消息遗留旧格式）
+                    if block.get("name") == "Task":
+                        input_obj = block.get("input")
+                        if isinstance(input_obj, dict):
+                            if "run_in_background" not in input_obj:
+                                input_obj["run_in_background"] = False
+                            if "load_skills" not in input_obj:
+                                input_obj["load_skills"] = []
     return body
 
 
@@ -337,26 +345,11 @@ async def proxy(path: str, request: Request):
     if body:
         try:
             body_json = json.loads(body)
-            safe_keys = {
-                "model",
-                "messages",
-                "max_tokens",
-                "metadata",
-                "stop_sequences",
-                "stream",
-                "system",
-                "temperature",
-                "top_k",
-                "top_p",
-                "tools",
-                "thinking",
-            }
-            filtered_body = {k: v for k, v in body_json.items() if k in safe_keys}
-            model = filtered_body.get("model", "")
+            model = body_json.get("model", "")
             if "anyrouter/" in model:
-                filtered_body["model"] = model.replace("anyrouter/", "")
+                body_json["model"] = model.replace("anyrouter/", "")
             if config["debug"]:
-                print(f"[PROXY] Original request keys: {list(body_json.keys())}")
+                print(f"[PROXY] Request keys: {list(body_json.keys())}")
                 print(
                     f"[PROXY] Has tools: {'tools' in body_json}, tools count: {len(body_json.get('tools', []))}"
                 )
@@ -367,26 +360,28 @@ async def proxy(path: str, request: Request):
                 or "opus" in model.lower()
                 or "haiku" in model.lower()
             ) and CLAUDE_CODE_TOOLS:
-                filtered_body["tools"] = copy.deepcopy(CLAUDE_CODE_TOOLS)
+                body_json["tools"] = copy.deepcopy(CLAUDE_CODE_TOOLS)
                 if config["debug"]:
                     print(
                         f"[PROXY] Injected {len(CLAUDE_CODE_TOOLS)} Claude Code tools"
                     )
                 if CLAUDE_CODE_SYSTEM:
-                    filtered_body["system"] = copy.deepcopy(CLAUDE_CODE_SYSTEM)
+                    body_json["system"] = copy.deepcopy(CLAUDE_CODE_SYSTEM)
                     if config["debug"]:
                         print(f"[PROXY] Injected Claude Code system prompt")
                 if "sonnet" in model.lower() or "opus" in model.lower():
-                    if "thinking" not in filtered_body:
-                        filtered_body["thinking"] = {
+                    if "thinking" not in body_json:
+                        body_json["thinking"] = {
                             "budget_tokens": 10000,
                             "type": "enabled",
                         }
                         if config["debug"]:
                             print(f"[PROXY] Injected thinking config")
-                filtered_body["metadata"] = {"user_id": "proxy_user"}
-            wants_stream = filtered_body.get("stream", False)
-            body_json = filtered_body
+                body_json["metadata"] = {"user_id": "proxy_user"}
+            # anyrouter 后端要求的必填参数，opencode 不会发送，需要补上默认值
+            if "load_skills" not in body_json:
+                body_json["load_skills"] = []
+            wants_stream = body_json.get("stream", False)
             if is_messages_endpoint:
                 body_json = transform_request_body(body_json)
         except Exception as e:
@@ -434,12 +429,12 @@ async def proxy(path: str, request: Request):
                         status_code=502,
                         media_type="application/json",
                     )
-                if resp.status_code in [403, 500]:
+                if resp.status_code >= 400:
                     error_content = await resp.aread()
                     await resp.aclose()
                     if config["debug"]:
                         print(
-                            f"[PROXY] Error response: {error_content.decode('utf-8', errors='ignore')[:500]}"
+                            f"[PROXY] Error {resp.status_code}: {error_content.decode('utf-8', errors='ignore')[:500]}"
                         )
                     return Response(
                         content=error_content,
@@ -466,7 +461,11 @@ async def proxy(path: str, request: Request):
                         status_code=502,
                         media_type="application/json",
                     )
-                if resp.status_code in [403, 500]:
+                if resp.status_code >= 400:
+                    if config["debug"]:
+                        print(
+                            f"[PROXY] Error {resp.status_code}: {resp.content.decode('utf-8', errors='ignore')[:500]}"
+                        )
                     return Response(
                         content=resp.content,
                         status_code=resp.status_code,
