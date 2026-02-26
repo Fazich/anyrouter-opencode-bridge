@@ -210,14 +210,6 @@ def transform_request_body(body):
                     and block.get("name")
                 ):
                     block["name"] = map_tool_name(block.get("name"))
-                    # 兜底注入 Task 工具的必填参数（模型偶尔不传或历史消息遗留旧格式）
-                    if block.get("name") == "Task":
-                        input_obj = block.get("input")
-                        if isinstance(input_obj, dict):
-                            if "run_in_background" not in input_obj:
-                                input_obj["run_in_background"] = False
-                            if "load_skills" not in input_obj:
-                                input_obj["load_skills"] = []
     return body
 
 
@@ -359,11 +351,16 @@ async def proxy(path: str, request: Request):
                 "sonnet" in model.lower()
                 or "opus" in model.lower()
                 or "haiku" in model.lower()
-            ) and CLAUDE_CODE_TOOLS:
-                body_json["tools"] = copy.deepcopy(CLAUDE_CODE_TOOLS)
-                if config["debug"]:
+            ):
+                if not body_json.get("tools") and CLAUDE_CODE_TOOLS:
+                    body_json["tools"] = copy.deepcopy(CLAUDE_CODE_TOOLS)
+                    if config["debug"]:
+                        print(
+                            f"[PROXY] Injected {len(CLAUDE_CODE_TOOLS)} Claude Code tools (fallback)"
+                        )
+                elif config["debug"]:
                     print(
-                        f"[PROXY] Injected {len(CLAUDE_CODE_TOOLS)} Claude Code tools"
+                        f"[PROXY] Using client's tools ({len(body_json.get('tools', []))} tools)"
                     )
                 if CLAUDE_CODE_SYSTEM:
                     body_json["system"] = copy.deepcopy(CLAUDE_CODE_SYSTEM)
