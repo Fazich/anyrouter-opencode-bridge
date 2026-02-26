@@ -137,14 +137,16 @@ def get_claude_headers(is_stream=False, model=""):
     return headers
 
 def create_async_client():
-    proxy_url = config['proxy_url'] if config['use_proxy'] else None
+    use_proxy = bool(config.get('use_proxy', False))
+    raw_proxy_url = config.get('proxy_url')
+    proxy_url = raw_proxy_url.strip() if use_proxy and isinstance(raw_proxy_url, str) else None
     if config['debug']:
         print(f"[SYSTEM] Creating client with proxy: {proxy_url}")
     return httpx.AsyncClient(
         http2=True,
         verify=False,
         timeout=httpx.Timeout(connect=60.0, read=300.0, write=60.0, pool=300.0),
-        proxies=proxy_url,
+        proxy=proxy_url,
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
     )
 

@@ -17,3 +17,4 @@ captured_requests.json
 request_body_*.json
 test_models.py
 main_v22_full.py
+.venv
