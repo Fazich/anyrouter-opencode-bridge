@@ -5,6 +5,8 @@ import os
 import traceback
 import argparse
 import asyncio
+import copy
+import codecs
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import uvicorn
@@ -20,9 +22,15 @@ DEFAULT_CONFIG = {
 }
 
 config = {}
-CLIENT = None
+CLIENT: httpx.AsyncClient | None = None
 CLAUDE_CODE_TOOLS = []
 CLAUDE_CODE_SYSTEM = []
+
+TOOL_NAME_MAP = {
+    "todowrite": "TodoWrite",
+    "webfetch": "WebFetch",
+    "google_search": "Google_Search",
+}
 
 def load_claude_code_templates():
     global CLAUDE_CODE_TOOLS, CLAUDE_CODE_SYSTEM
@@ -136,7 +144,7 @@ def create_async_client():
         http2=True,
         verify=False,
         timeout=httpx.Timeout(connect=60.0, read=300.0, write=60.0, pool=300.0),
-        proxy=proxy_url,
+        proxies=proxy_url,
         limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
     )
 
@@ -151,12 +159,104 @@ async def shutdown():
     if CLIENT:
         await CLIENT.aclose()
 
-async def stream_response(resp):
+def map_tool_name(name):
+    if not isinstance(name, str) or not name:
+        return name
+    mapped = TOOL_NAME_MAP.get(name)
+    if mapped:
+        return mapped
+    return name[0].upper() + name[1:]
+
+def transform_request_body(body):
+    if not isinstance(body, dict):
+        return body
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and tool.get("name"):
+                tool["name"] = map_tool_name(tool.get("name"))
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name"):
+                    block["name"] = map_tool_name(block.get("name"))
+    return body
+
+def transform_response_body(body):
+    if not isinstance(body, dict):
+        return body
+    content = body.get("content")
+    if not isinstance(content, list):
+        return body
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        input_obj = block.get("input")
+        if not isinstance(input_obj, dict):
+            continue
+        for key, value in list(input_obj.items()):
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped.startswith("[") or stripped.startswith("{"):
+                    try:
+                        input_obj[key] = json.loads(value)
+                    except Exception:
+                        pass
+    return body
+
+def transform_sse_line(line):
+    if not line.startswith("data:"):
+        return line
+    data_str = line[5:].strip()
+    if not data_str or data_str == "[DONE]":
+        return line
+    try:
+        payload = json.loads(data_str)
+    except Exception:
+        return line
+    if not isinstance(payload, dict):
+        return line
+    if payload.get("type") == "content_block_start":
+        content_block = payload.get("content_block")
+        if isinstance(content_block, dict) and content_block.get("type") == "tool_use" and content_block.get("name"):
+            content_block["name"] = map_tool_name(content_block.get("name"))
+            return f"data: {json.dumps(payload, ensure_ascii=False)}"
+    return line
+
+def transform_sse_event_block(event_block):
+    return "\n".join(transform_sse_line(line) for line in event_block.split("\n"))
+
+async def stream_response(resp, transform_sse=False):
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
     try:
         async for chunk in resp.aiter_bytes():
-            yield chunk
+            if not transform_sse:
+                yield chunk
+                continue
+            buffer += decoder.decode(chunk)
+            while "\n\n" in buffer:
+                event_block, buffer = buffer.split("\n\n", 1)
+                transformed = transform_sse_event_block(event_block)
+                yield f"{transformed}\n\n".encode("utf-8")
+        if transform_sse:
+            buffer += decoder.decode(b"", final=True)
+            if buffer.strip():
+                transformed = transform_sse_event_block(buffer)
+                yield f"{transformed}\n\n".encode("utf-8")
     except Exception as e:
         print(f"[PROXY] Stream error: {e}")
+    finally:
+        try:
+            await resp.aclose()
+        except Exception:
+            pass
 
 @app.get("/config")
 async def get_config():
@@ -181,7 +281,11 @@ async def health():
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def proxy(path: str, request: Request):
     global CLIENT
+    if CLIENT is None:
+        CLIENT = create_async_client()
     target_url = f"{config['target_base_url']}/{path}"
+    normalized_path = "/" + path.lstrip("/")
+    is_messages_endpoint = normalized_path.endswith("/messages")
     if path == "messages":
         target_url += "?beta=true"
     body = await request.body()
@@ -201,11 +305,11 @@ async def proxy(path: str, request: Request):
                 print(f"[PROXY] Has system: {'system' in body_json}")
                 print(f"[PROXY] Has thinking: {'thinking' in body_json}")
             if ('sonnet' in model.lower() or 'opus' in model.lower() or 'haiku' in model.lower()) and CLAUDE_CODE_TOOLS:
-                filtered_body['tools'] = CLAUDE_CODE_TOOLS
+                filtered_body['tools'] = copy.deepcopy(CLAUDE_CODE_TOOLS)
                 if config['debug']:
                     print(f"[PROXY] Injected {len(CLAUDE_CODE_TOOLS)} Claude Code tools")
                 if CLAUDE_CODE_SYSTEM:
-                    filtered_body['system'] = CLAUDE_CODE_SYSTEM
+                    filtered_body['system'] = copy.deepcopy(CLAUDE_CODE_SYSTEM)
                     if config['debug']:
                         print(f"[PROXY] Injected Claude Code system prompt")
                 if 'sonnet' in model.lower() or 'opus' in model.lower():
@@ -216,6 +320,8 @@ async def proxy(path: str, request: Request):
                 filtered_body['metadata'] = {"user_id": "proxy_user"}
             wants_stream = filtered_body.get('stream', False)
             body_json = filtered_body
+            if is_messages_endpoint:
+                body_json = transform_request_body(body_json)
         except Exception as e:
             if config['debug']:
                 print(f"[PROXY] Body parse error: {e}")
@@ -257,7 +363,7 @@ async def proxy(path: str, request: Request):
                     if config['debug']:
                         print(f"[PROXY] Error response: {error_content.decode('utf-8', errors='ignore')[:500]}")
                     return Response(content=error_content, status_code=resp.status_code, media_type="application/json")
-                return StreamingResponse(stream_response(resp), status_code=resp.status_code, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                return StreamingResponse(stream_response(resp, transform_sse=is_messages_endpoint), status_code=resp.status_code, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
             else:
                 resp = await CLIENT.send(req)
                 if config['debug']:
@@ -270,7 +376,16 @@ async def proxy(path: str, request: Request):
                     return Response(content=b'{"error":{"message":"Network error after max retries"}}', status_code=502, media_type="application/json")
                 if resp.status_code in [403, 500]:
                     return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
-                return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
+                response_content = resp.content
+                content_type = (resp.headers.get("content-type") or "").lower()
+                if is_messages_endpoint and "application/json" in content_type:
+                    try:
+                        parsed = json.loads(response_content)
+                        transformed = transform_response_body(parsed)
+                        response_content = json.dumps(transformed, ensure_ascii=False).encode("utf-8")
+                    except Exception:
+                        pass
+                return Response(content=response_content, status_code=resp.status_code, media_type="application/json")
         except Exception as e:
             if config['debug']:
                 print(f"[PROXY] Error: {type(e).__name__}: {e}")
@@ -300,6 +415,6 @@ if __name__ == '__main__':
         sys.stdout.reconfigure(encoding='utf-8')
     log_level = "info" if config['debug'] else "warning"
     try:
-        uvicorn.run(app, host="127.0.0.1", port=8765, log_level=log_level)
+        uvicorn.run(app, host="0.0.0.0", port=8765, log_level=log_level)
     except KeyboardInterrupt:
         print("\nStopping server...")
